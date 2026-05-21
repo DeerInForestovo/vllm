@@ -244,3 +244,35 @@ def test_determine_expert_map_comprehensive():
                 f"expert_placement_strategy={expert_placement_strategy}: "
                 f"expected map {expected_map_pattern}, got {actual_map}"
             )
+
+
+def test_determine_expert_map_custom_assignment():
+    """Test custom expert placement with explicit rank-to-experts mapping."""
+    custom_rank_to_experts = [
+        [0, 3, 5],
+        [1, 2, 4],
+    ]
+
+    local_num_experts, expert_map, _ = determine_expert_map(
+        ep_size=2,
+        ep_rank=0,
+        global_num_experts=6,
+        expert_placement_strategy="custom",
+        custom_rank_to_experts=custom_rank_to_experts,
+    )
+
+    assert local_num_experts == 3
+    assert expert_map is not None
+    assert expert_map.tolist() == [0, -1, -1, 1, -1, 2]
+
+    local_num_experts, expert_map, _ = determine_expert_map(
+        ep_size=2,
+        ep_rank=1,
+        global_num_experts=6,
+        expert_placement_strategy="custom",
+        custom_rank_to_experts=custom_rank_to_experts,
+    )
+
+    assert local_num_experts == 3
+    assert expert_map is not None
+    assert expert_map.tolist() == [-1, 0, 1, -1, 2, -1]

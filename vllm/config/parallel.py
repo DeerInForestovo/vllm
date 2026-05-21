@@ -31,7 +31,7 @@ else:
 logger = init_logger(__name__)
 _NUMACTL_CPUSET_PATTERN = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
 
-ExpertPlacementStrategy = Literal["linear", "round_robin"]
+ExpertPlacementStrategy = Literal["linear", "round_robin", "custom"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
 EPLBPolicyOption = Literal["default"]
@@ -170,7 +170,14 @@ class ParallelConfig:
     - "round_robin": Experts are placed in a round-robin manner. For example,
       with 4 experts and 2 ranks, rank 0 will have experts [0, 2] and rank 1
       will have experts [1, 3]. This strategy can help improve load balancing
-      for grouped expert models with no redundant experts."""
+      for grouped expert models with no redundant experts.
+    - "custom": Experts are placed based on a user input mapping json file.
+    """
+    expert_placement_config_file: str | None = None
+    """Path to the custom expert placement mapping JSON file.
+
+    This is used only when `expert_placement_strategy="custom"`.
+    """
     all2all_backend: All2AllBackend = "allgather_reducescatter"
     """All2All backend for MoE expert parallel communication. Available options:
 
@@ -441,6 +448,15 @@ class ParallelConfig:
         ):
             raise ValueError(
                 "numa_bind_nodes and numa_bind_cpus require numa_bind=True."
+            )
+
+        if (
+            self.expert_placement_strategy == "custom"
+            and not self.expert_placement_config_file
+        ):
+            raise ValueError(
+                "expert_placement_config_file must be set when "
+                "expert_placement_strategy='custom'."
             )
 
         if self.enable_eplb:

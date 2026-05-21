@@ -7,6 +7,10 @@ This module contains the ExpertMapManager class which manages expert ID
 mappings and placement strategies for Expert Parallelism in MoE models.
 """
 
+import json
+import re
+from typing import Any
+
 import torch
 
 from vllm.config.parallel import ExpertPlacementStrategy
@@ -18,12 +22,101 @@ from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
 
 logger = init_logger(__name__)
 
+_CUSTOM_EXPERT_MAP_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _extract_layer_id(layer_name: str | None) -> int | None:
+    if not layer_name:
+        return None
+
+    match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
+    if match:
+        return int(match.group(1))
+
+    fallback = re.search(r"(\d+)", layer_name)
+    return int(fallback.group(1)) if fallback else None
+
+
+def _load_custom_expert_layers(config_file: str) -> dict[str, Any]:
+    if config_file not in _CUSTOM_EXPERT_MAP_CACHE:
+        with open(config_file, encoding="utf-8") as f:
+            payload = json.load(f)
+        _CUSTOM_EXPERT_MAP_CACHE[config_file] = payload
+    return _CUSTOM_EXPERT_MAP_CACHE[config_file]
+
+
+def _get_custom_rank_to_experts(
+    config_file: str,
+    layer_id: int,
+    ep_size: int,
+    global_num_experts: int,
+) -> list[list[int]] | None:
+    payload = _load_custom_expert_layers(config_file)
+    layers = payload.get("layers")
+    if not isinstance(layers, dict):
+        raise ValueError(
+            "Custom expert placement file must contain a dict field 'layers'."
+        )
+
+    layer_entry = layers.get(str(layer_id))
+    if layer_entry is None:
+        return None
+
+    if isinstance(layer_entry, dict):
+        rank_to_experts = layer_entry.get("rank_to_experts")
+    else:
+        rank_to_experts = layer_entry
+
+    if not isinstance(rank_to_experts, list):
+        raise ValueError(
+            f"Invalid custom mapping for layer {layer_id}: expected list of ranks."
+        )
+    if len(rank_to_experts) != ep_size:
+        raise ValueError(
+            f"Custom mapping for layer {layer_id} has {len(rank_to_experts)} ranks, "
+            f"but ep_size is {ep_size}."
+        )
+
+    normalized: list[list[int]] = []
+    seen = set()
+    for rank, experts in enumerate(rank_to_experts):
+        if not isinstance(experts, list):
+            raise ValueError(
+                f"Custom mapping for layer {layer_id}, rank {rank} must be a list."
+            )
+        parsed = [int(expert_id) for expert_id in experts]
+        for expert_id in parsed:
+            if not 0 <= expert_id < global_num_experts:
+                raise ValueError(
+                    f"Custom mapping layer {layer_id} has out-of-range expert "
+                    f"id {expert_id}, expected [0, {global_num_experts})."
+                )
+            if expert_id in seen:
+                raise ValueError(
+                    f"Custom mapping layer {layer_id} contains duplicate "
+                    f"expert id {expert_id}."
+                )
+            seen.add(expert_id)
+        normalized.append(parsed)
+
+    expected = set(range(global_num_experts))
+    if seen != expected:
+        missing = sorted(expected - seen)
+        raise ValueError(
+            f"Custom mapping layer {layer_id} must cover all experts exactly once. "
+            f"Missing experts: {missing[:10]}"
+            f"{'...' if len(missing) > 10 else ''}."
+        )
+
+    return normalized
+
 
 def determine_expert_map(
     ep_size: int,
     ep_rank: int,
     global_num_experts: int,
     expert_placement_strategy: ExpertPlacementStrategy = "linear",
+    custom_rank_to_experts: list[list[int]] | None = None,
     num_fused_shared_experts: int = 0,
     return_expert_mask: bool = False,
 ) -> tuple[int, torch.Tensor | None, torch.Tensor | None]:
@@ -39,6 +132,8 @@ def determine_expert_map(
             group
         global_num_experts: The total number of experts in the model.
         expert_placement_strategy: The expert placement strategy.
+        custom_rank_to_experts: Custom rank-to-experts assignment for this
+            layer. Used only when strategy is 'custom'.
         num_fused_shared_experts: Number of fused shared experts (for AITER)
         return_expert_mask: Whether to return expert mask for AITER
 
@@ -63,21 +158,22 @@ def determine_expert_map(
     if ep_size == 1:
         return (global_num_experts, None, None)
 
-    # Distribute experts as evenly as possible to each rank.
-    base_experts = global_num_experts // ep_size
-    remainder = global_num_experts % ep_size
-    local_num_experts = base_experts + 1 if ep_rank < remainder else base_experts
-
     # Create a tensor of size num_experts filled with -1
     expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32)
 
     # Create an expert map for the local experts
     if expert_placement_strategy == "linear":
+        base_experts = global_num_experts // ep_size
+        remainder = global_num_experts % ep_size
+        local_num_experts = base_experts + 1 if ep_rank < remainder else base_experts
         start_idx = ep_rank * base_experts + min(ep_rank, remainder)
         expert_map[start_idx : start_idx + local_num_experts] = torch.arange(
             0, local_num_experts, dtype=torch.int32
         )
     elif expert_placement_strategy == "round_robin":
+        base_experts = global_num_experts // ep_size
+        remainder = global_num_experts % ep_size
+        local_num_experts = base_experts + 1 if ep_rank < remainder else base_experts
         local_log_experts = torch.arange(
             ep_rank, global_num_experts, ep_size, dtype=torch.int32
         )
@@ -85,6 +181,17 @@ def determine_expert_map(
         expert_map[local_log_experts] = torch.arange(
             0, local_num_experts, dtype=torch.int32
         )
+    elif expert_placement_strategy == "custom":
+        if custom_rank_to_experts is None:
+            raise ValueError(
+                "Custom expert placement strategy requires custom_rank_to_experts."
+            )
+        local_experts = custom_rank_to_experts[ep_rank]
+        local_num_experts = len(local_experts)
+        if local_num_experts > 0:
+            expert_map[torch.tensor(local_experts, dtype=torch.int64)] = torch.arange(
+                0, local_num_experts, dtype=torch.int32
+            )
     else:
         raise ValueError(
             "Unsupported expert placement strategy "
@@ -156,7 +263,7 @@ class ExpertMapManager:
     Responsibilities:
     - Calculate local vs global expert counts
     - Map between global, local, and physical expert IDs
-    - Manage placement strategies (linear, round_robin)
+    - Manage placement strategies (linear, round_robin, custom)
     - Maintain routing tables for round-robin placement
     - Support dynamic reconfiguration of EP topology
 
@@ -190,6 +297,8 @@ class ExpertMapManager:
         moe_parallel_config: FusedMoEParallelConfig,
         placement_strategy: ExpertPlacementStrategy,
         enable_eplb: bool,
+        layer_name: str = "",
+        expert_placement_config_file: str | None = None,
         num_fused_shared_experts: int = 0,
         rocm_aiter_enabled: bool = False,
     ):
@@ -200,7 +309,11 @@ class ExpertMapManager:
             global_num_experts: Total number of experts across all ranks
             moe_parallel_config: MoE parallel configuration (contains ep_size,
                                  ep_rank, backend flags)
-            placement_strategy: Strategy for placing experts ('linear' or 'round_robin')
+            placement_strategy: Strategy for placing experts ('linear',
+                'round_robin', or 'custom')
+            layer_name: Name/prefix of this layer, used to resolve layer id
+                for custom placement.
+            expert_placement_config_file: JSON file path for custom placement.
             num_fused_shared_experts: Number of fused shared experts (for AITER)
             rocm_aiter_enabled: Whether ROCm AITER fusion is enabled
         """
@@ -210,6 +323,10 @@ class ExpertMapManager:
         self.rocm_aiter_enabled = rocm_aiter_enabled
         self.top_k = top_k
         self.max_num_batched_tokens = max_num_batched_tokens
+        self.layer_name = layer_name
+        self.layer_id = _extract_layer_id(layer_name)
+        self.expert_placement_config_file = expert_placement_config_file
+        self._custom_rank_to_experts: list[list[int]] | None = None
 
         if moe_parallel_config.use_ep:
             # Determine expert placement strategy before creating manager
@@ -225,6 +342,11 @@ class ExpertMapManager:
         self._placement_strategy = self._determine_placement_strategy(
             placement_strategy
         )
+
+        if self._placement_strategy == "custom":
+            self._custom_rank_to_experts = self._load_custom_rank_to_experts_for_layer()
+            if self._custom_rank_to_experts is None:
+                self._placement_strategy = "linear"
 
         # Calculate expert mappings
         self._calculate_expert_maps()
@@ -318,7 +440,7 @@ class ExpertMapManager:
 
     @property
     def placement_strategy(self) -> ExpertPlacementStrategy:
-        """Expert placement strategy ('linear' or 'round_robin')."""
+        """Expert placement strategy ('linear', 'round_robin', or 'custom')."""
         return self._placement_strategy
 
     @property
@@ -418,6 +540,11 @@ class ExpertMapManager:
         self, requested_strategy: ExpertPlacementStrategy
     ) -> ExpertPlacementStrategy:
         """Determine effective placement strategy based on config."""
+        if requested_strategy == "custom":
+            if self.ep_size == 1:
+                return "linear"
+            return "custom"
+
         if requested_strategy != "round_robin":
             return requested_strategy
 
@@ -437,6 +564,35 @@ class ExpertMapManager:
 
         return "round_robin"
 
+    def _load_custom_rank_to_experts_for_layer(self) -> list[list[int]] | None:
+        if not self.expert_placement_config_file:
+            raise ValueError(
+                "expert_placement_strategy='custom' requires setting "
+                "expert_placement_config_file."
+            )
+        if self.layer_id is None:
+            raise ValueError(
+                "Unable to infer layer id from layer name for custom expert "
+                f"placement: '{self.layer_name}'."
+            )
+
+        mapping = _get_custom_rank_to_experts(
+            config_file=self.expert_placement_config_file,
+            layer_id=self.layer_id,
+            ep_size=self.ep_size,
+            global_num_experts=self.global_num_experts,
+        )
+        if mapping is None:
+            logger.warning_once(
+                "Layer %s is not present in custom placement file '%s'; "
+                "falling back to linear placement for this layer.",
+                self.layer_id,
+                self.expert_placement_config_file,
+            )
+            return None
+
+        return mapping
+
     def _calculate_expert_maps(self) -> None:
         """Calculate expert mappings based on placement strategy."""
         (
@@ -448,6 +604,7 @@ class ExpertMapManager:
             ep_rank=self.ep_rank,
             global_num_experts=self.global_num_experts,
             expert_placement_strategy=self._placement_strategy,
+            custom_rank_to_experts=self._custom_rank_to_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             return_expert_mask=self.rocm_aiter_enabled,
         )

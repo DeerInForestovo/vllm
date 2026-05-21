@@ -255,6 +255,10 @@ class FusedMoE(PluggableLayer):
             moe_parallel_config=self.moe_parallel_config,
             placement_strategy=self.expert_placement_strategy,
             enable_eplb=enable_eplb,
+            layer_name=self.layer_name,
+            expert_placement_config_file=(
+                vllm_config.parallel_config.expert_placement_config_file
+            ),
             num_fused_shared_experts=self.num_fused_shared_experts,
             rocm_aiter_enabled=self.rocm_aiter_fmoe_enabled,
         )
